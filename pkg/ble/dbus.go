@@ -78,7 +78,7 @@ func dbusSignalSniffer(ctx context.Context) {
 					changes, _ := sig.Body[1].(map[string]dbus.Variant)
 					if val, ok := changes["Value"]; ok {
 						data, _ := val.Value().([]byte)
-						logger.Infof(ctx, "[dbus-sniffer] CHARACTERISTIC VALUE CHANGED: path=%s data=%X", sig.Path, data)
+						logger.Debugf(ctx, "[dbus-sniffer] CHARACTERISTIC VALUE CHANGED: path=%s data=%X", sig.Path, data)
 					} else {
 						logger.Debugf(ctx, "[dbus-sniffer] characteristic property changed: path=%s changes=%v", sig.Path, changes)
 					}
