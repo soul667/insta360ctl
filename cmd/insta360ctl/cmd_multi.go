@@ -14,6 +14,7 @@ import (
 	"github.com/xaionaro-go/insta360ctl/pkg/camera"
 	"github.com/xaionaro-go/insta360ctl/pkg/direct"
 	"github.com/xaionaro-go/insta360ctl/pkg/multi"
+	"github.com/xaionaro-go/insta360ctl/pkg/protocol"
 	"github.com/xaionaro-go/insta360ctl/pkg/protocol/messagecode"
 )
 
@@ -449,7 +450,7 @@ func resolveMultiAction(args []string, noWait bool) (string, multi.Action, error
 }
 
 func recordAction(start, noWait bool) multi.Action {
-	return func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
+	return func(ctx context.Context, dev *direct.Device, out io.Writer) error {
 		if noWait {
 			code := messagecode.CodeStopRecording
 			if start {
@@ -460,8 +461,47 @@ func recordAction(start, noWait bool) multi.Action {
 		if start {
 			return dev.StartRecording(ctx)
 		}
-		return dev.StopRecording(ctx)
+		// Stop via SendCommand so we can keep the acknowledgment body:
+		// on network-framed cameras (X5) it contains the recorded file path,
+		// whose name embeds the camera clock at recording start.
+		resp, err := dev.SendCommand(ctx, messagecode.CodeStopRecording, nil)
+		if err != nil {
+			return err
+		}
+		if info := netPrintableBody(dev, resp); info != "" {
+			fmt.Fprintf(out, "file: %s\n", info)
+		}
+		return nil
 	}
+}
+
+// netPrintableBody extracts printable ASCII runs from a network-framed
+// response body (e.g. the recorded file path in the STOP_CAPTURE ACK).
+func netPrintableBody(dev *direct.Device, resp []byte) string {
+	if dev.Cam.DirectProtoFormat() != camera.ProtoFormatNetwork {
+		return ""
+	}
+	msg, err := protocol.ParseNetMessage(resp)
+	if err != nil || len(msg.Body) == 0 {
+		return ""
+	}
+	var parts []string
+	var run []byte
+	flush := func() {
+		if len(run) >= 4 {
+			parts = append(parts, string(run))
+		}
+		run = nil
+	}
+	for _, b := range msg.Body {
+		if b >= 32 && b < 127 {
+			run = append(run, b)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return strings.Join(parts, " ")
 }
 
 func printMultiResults(command string, results []multi.Result) {
