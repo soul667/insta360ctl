@@ -98,6 +98,32 @@ Practical consequences:
 4. Nothing in the BLE remote protocol provides a timecode or genlock signal;
    frame-exact sync is a post-processing/external-clocking problem.
 
+## X5 notes (network framing)
+
+X5 speaks the WiFi/TCP packet protocol over BLE instead of Header16. The
+implementation (`camera.ProtoFormatNetwork` + `protocol/netframe.go`) is
+verified against real hardware:
+
+- commands are wrapped as `[u32 length][0x04 00 00][code u16][02][seq u24][80][00 00][body]`;
+- the camera acknowledges with code 200 (HTTP-style) echoing the sequence;
+- STOP_CAPTURE acknowledges with the recorded file path in the body;
+- the camera sends 1 Hz keep-alives `07 00 00 00 05 00 00`, and the host
+  sends its own every 2s;
+- a `syNceNdinS` sync handshake is performed on connect (commands have been
+  observed to work without it, but the protocol does it, so we keep it).
+
+Measured dual-camera record start: dispatch spread <= 50µs, ACK ~90-110ms,
+all cameras reliably producing files. Battery/storage/device-info queries
+are not mapped yet (`not implemented` errors), and `mode`/`hdr` are refused
+because their legacy codes mean something else over this protocol.
+
+For timecode: X5 has a native Timecode feature (stored in the file's
+Timecode Track). Calibrate both cameras via the Insta360 app's Timecode
+page refresh, or feed both from an external LTC generator through the Mic
+Adapter. A software clock-set attempt via the camera's OSC API is provided
+in the workspace `tools/osc_settime.py`; verify the resulting frame offset
+with `tools/sync_check.py`.
+
 ## Troubleshooting
 
 - `no cameras found` — check that the cameras are powered on, not connected
@@ -108,3 +134,9 @@ Practical consequences:
 - Large dispatch spread (>50ms) — avoid USB 3.0 interference near the
   adapter, try `--no-wait`, and keep both cameras roughly equidistant from
   the host.
+- A camera stops answering some queries — each command has its own deadline
+  (`--command-timeout`, default 15s), so one unresponsive command fails that
+  camera only instead of blocking the whole broadcast. Note that not every
+  command works on every model: battery/storage queries are verified on
+  GO 3, while X3/X4/X5 use a different firmware build and may not answer
+  the same codes.

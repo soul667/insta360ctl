@@ -18,6 +18,20 @@ A Go CLI tool for controlling Insta360 cameras via BLE and WiFi from Linux.
 | ONE X2 | No                | Yes            |
 | ONE R  | No                | Yes            |
 
+### X5 and newer: network-framed protocol
+
+X5 does not use the Header16 framing. It speaks the same length-prefixed
+packet protocol as the camera's WiFi TCP control channel: a 4-byte total
+length, then 0x04 MESSAGE / 0x05 KEEPALIVE / 0x06 SYNC packets, with the
+`syNceNdinS` sync handshake. This is implemented transparently
+(`camera.ProtoFormatNetwork`, `protocol/netframe.go`), and simultaneous
+record start/stop on two X5s has been verified on real hardware.
+
+Queries that have not been mapped for this protocol yet (battery, storage,
+device info) report "not implemented" instead of failing silently, and
+`mode`/`hdr` are refused because the legacy codes have different semantics.
+Use `multi shell` + `raw <hex>` to probe additional command codes.
+
 ## Installation
 
 ```bash

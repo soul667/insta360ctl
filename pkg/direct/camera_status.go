@@ -19,6 +19,26 @@ import (
 //   - 0x0190 (400) = unknown command
 //   - 0x01F4 (500) = execution error
 func (d *Device) extractPayload(resp []byte) ([]byte, error) {
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		// X5-style network framing: the response is a raw MESSAGE payload
+		// (12-byte header + body), with HTTP-style status codes.
+		msg, err := protocol.ParseNetMessage(resp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode network message response: %w", err)
+		}
+		switch msg.Code {
+		case uint16(messagecode.CodeResponseOK):
+			return msg.Body, nil
+		case uint16(messagecode.CodeResponseBadRequest):
+			return nil, fmt.Errorf("camera returned 400: %s", extractProtoString(msg.Body))
+		case uint16(messagecode.CodeResponseError):
+			return nil, fmt.Errorf("camera returned 500: %s", extractProtoString(msg.Body))
+		case uint16(messagecode.CodeResponseNotImpl):
+			return nil, fmt.Errorf("camera returned 501: not implemented")
+		default:
+			return msg.Body, nil
+		}
+	}
 	if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
 		// GO 2/GO 3: inner data uses Go2 header format.
 		hdr, payload, err := protocol.DecodeGo2Message(resp)
@@ -75,6 +95,10 @@ func extractProtoString(pb []byte) string {
 
 // GetBatteryInfo queries the camera's battery status.
 func (d *Device) GetBatteryInfo(ctx context.Context) (*camera.BatteryInfo, error) {
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		return nil, fmt.Errorf("battery query is not implemented for network-framed cameras (X5) yet")
+	}
+
 	// GO 3 uses a different command code (0x19) than X3 (0x12).
 	cmd := messagecode.CodeGetBatteryInfo
 	if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
@@ -153,6 +177,9 @@ func parseGo3BatteryProtobuf(pb []byte) (level uint8, charging bool) {
 
 // GetStorageInfo queries the camera's storage status.
 func (d *Device) GetStorageInfo(ctx context.Context) (*camera.StorageInfo, error) {
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		return nil, fmt.Errorf("storage query is not implemented for network-framed cameras (X5) yet")
+	}
 	if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
 		return d.getStorageInfoGo3(ctx)
 	}
@@ -213,6 +240,9 @@ func (d *Device) getStorageInfoHeader16(ctx context.Context) (*camera.StorageInf
 
 // GetDeviceInfo queries the camera's device information (firmware, serial).
 func (d *Device) GetDeviceInfo(ctx context.Context) (firmware string, serial string, err error) {
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		return "", "", fmt.Errorf("device info query is not implemented for network-framed cameras (X5) yet")
+	}
 	resp, err := d.SendCommand(ctx, messagecode.CodeGetDeviceInfo, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("get device info failed: %w", err)
@@ -251,7 +281,13 @@ func (d *Device) GetDeviceInfo(ctx context.Context) (firmware string, serial str
 
 // GetCameraState queries the overall camera state.
 func (d *Device) GetCameraState(ctx context.Context) ([]byte, error) {
-	resp, err := d.SendCommand(ctx, messagecode.CodeGetCameraState, nil)
+	cmd := messagecode.CodeGetCameraState
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		// Network-framed cameras (X5) answer GET_CURRENT_CAPTURE_STATUS
+		// (0x0F) with a CameraCaptureStatus protobuf.
+		cmd = messagecode.CodeGetCurrentCaptureStatus
+	}
+	resp, err := d.SendCommand(ctx, cmd, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get camera state failed: %w", err)
 	}

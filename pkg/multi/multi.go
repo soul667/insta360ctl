@@ -162,6 +162,11 @@ type ConnectOptions struct {
 // Manager holds live BLE connections to multiple cameras.
 type Manager struct {
 	Devices []*direct.Device
+
+	// CommandTimeout, if set, bounds every action call during a broadcast.
+	// A command that does not complete in time fails with a deadline error
+	// instead of blocking the whole broadcast.
+	CommandTimeout time.Duration
 }
 
 // Connect discovers and initializes the requested cameras in parallel.
@@ -335,8 +340,14 @@ func (m *Manager) BroadcastAt(ctx context.Context, fireAt time.Time, action Acti
 	n := len(m.Devices)
 	outs := make([][]byte, n)
 	rs := FanOut(ctx, n, fireAt, func(ctx context.Context, i int) error {
+		actCtx := ctx
+		if m.CommandTimeout > 0 {
+			var cancel context.CancelFunc
+			actCtx, cancel = context.WithTimeout(ctx, m.CommandTimeout)
+			defer cancel()
+		}
 		var buf bytes.Buffer
-		err := action(ctx, m.Devices[i], &buf)
+		err := action(actCtx, m.Devices[i], &buf)
 		outs[i] = buf.Bytes()
 		return err
 	})

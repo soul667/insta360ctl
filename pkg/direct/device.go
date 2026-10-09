@@ -2,8 +2,10 @@ package direct
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/facebookincubator/go-belt/tool/logger"
 	"github.com/xaionaro-go/insta360ctl/pkg/ble"
@@ -36,6 +38,13 @@ type Device struct {
 	notificationCh chan []byte
 	syncCh         chan []byte // receives sync responses
 	go2SeqCounter  uint8      // sequence counter for Go2 format (1-254)
+
+	// Network-framed protocol (X5 and newer) state.
+	netSeqCounter      uint8         // sequence counter for network framing (1-254)
+	netRxBuf           []byte        // reassembly buffer for incoming network frames
+	netSyncCh          chan struct{} // receives the network sync echo
+	netKeepaliveCancel context.CancelFunc
+	writeMu            sync.Mutex // serializes whole-packet writes (commands vs keep-alives)
 
 	// Cached data from unsolicited notifications (GO 3).
 	cachedStorageInfo *camera.StorageInfo
@@ -148,6 +157,17 @@ func (d *Device) Init(ctx context.Context) error {
 		}
 	}
 
+	// For network-framed cameras (X5): perform the network SYNC handshake and
+	// start host keep-alives. Commands have been observed to work even without
+	// the sync echo, but the official protocol performs it, so we keep it for
+	// compatibility with stricter firmware.
+	if d.Cam.DirectProtoFormat() == camera.ProtoFormatNetwork {
+		if err := d.netHandshake(ctx); err != nil {
+			logger.Warnf(ctx, "network sync handshake failed (continuing anyway): %v", err)
+		}
+		d.startNetKeepalive()
+	}
+
 	logger.Infof(ctx, "initialized device %s", d)
 	return nil
 }
@@ -157,9 +177,12 @@ func (d *Device) makeNotifyHandler(uuid uint16) func([]byte) {
 		ctx := context.Background()
 		logger.Debugf(ctx, "notification received: uuid=0x%04X len=%d data=%X", uuid, len(b), b)
 
-		if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
+		switch d.Cam.DirectProtoFormat() {
+		case camera.ProtoFormatFFFrame:
 			d.handleGo2BleNotification(ctx, b)
-		} else {
+		case camera.ProtoFormatNetwork:
+			d.handleNetNotification(ctx, b)
+		default:
 			d.handleHeader16Notification(ctx, b)
 		}
 	}
@@ -287,7 +310,10 @@ func (d *Device) handleGo2BleNotification(ctx context.Context, b []byte) {
 
 		// Auto-respond with our sync packet (7 zero bytes).
 		syncResp := protocol.EncodeGo2BleSyncPacket(make([]byte, 7))
-		if err := d.charWrite.Write(syncResp, false); err != nil {
+		d.writeMu.Lock()
+		err := d.charWrite.Write(syncResp, false)
+		d.writeMu.Unlock()
+		if err != nil {
 			logger.Warnf(ctx, "failed to send sync response: %v", err)
 		} else {
 			logger.Infof(ctx, "sync response sent: %X", syncResp)
@@ -381,18 +407,26 @@ func (d *Device) handleHeader16Notification(ctx context.Context, b []byte) {
 
 // SendCommand sends a command and waits for the response.
 func (d *Device) SendCommand(ctx context.Context, cmd messagecode.Code, payload []byte) ([]byte, error) {
-	if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
+	switch d.Cam.DirectProtoFormat() {
+	case camera.ProtoFormatFFFrame:
 		return d.sendCommandGo2Ble(ctx, cmd, payload)
+	case camera.ProtoFormatNetwork:
+		return d.sendCommandNet(ctx, cmd, payload)
+	default:
+		return d.sendCommandHeader16(ctx, cmd, payload)
 	}
-	return d.sendCommandHeader16(ctx, cmd, payload)
 }
 
 // SendCommandNoResponse sends a command without waiting for a response.
 func (d *Device) SendCommandNoResponse(ctx context.Context, cmd messagecode.Code, payload []byte) error {
-	if d.Cam.DirectProtoFormat() == camera.ProtoFormatFFFrame {
+	switch d.Cam.DirectProtoFormat() {
+	case camera.ProtoFormatFFFrame:
 		return d.sendNoResponseGo2Ble(ctx, cmd, payload)
+	case camera.ProtoFormatNetwork:
+		return d.sendNoResponseNet(ctx, cmd, payload)
+	default:
+		return d.sendNoResponseHeader16(ctx, cmd, payload)
 	}
-	return d.sendNoResponseHeader16(ctx, cmd, payload)
 }
 
 // --- Go2BlePacket protocol (GO 2, GO 3) ---
@@ -424,7 +458,10 @@ func (d *Device) sendCommandGo2Ble(ctx context.Context, cmd messagecode.Code, pa
 	logger.Debugf(ctx, "sending Go2BLE cmd=%s(0x%04X) seq=%d payload=%X packet=%X",
 		cmd, uint16(cmd), seq, payload, packet)
 
-	if err := d.charWrite.Write(packet, false); err != nil {
+	d.writeMu.Lock()
+	err := d.charWrite.Write(packet, false)
+	d.writeMu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("failed to write Go2BlePacket: %w", err)
 	}
 
@@ -442,6 +479,8 @@ func (d *Device) sendNoResponseGo2Ble(ctx context.Context, cmd messagecode.Code,
 	packet := protocol.EncodeGo2BleMessagePacket(innerMsg)
 	logger.Debugf(ctx, "sending Go2BLE cmd=%s(0x%04X) seq=%d (no response) packet=%X", cmd, uint16(cmd), seq, packet)
 
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	return d.charWrite.Write(packet, false)
 }
 
@@ -464,12 +503,15 @@ func (d *Device) sendCommandHeader16(ctx context.Context, cmd messagecode.Code, 
 	logger.Debugf(ctx, "sending header16 cmd=%s seq=%d payload=%d bytes raw=%X", cmd, seq, len(payload), msg)
 
 	chunks := protocol.ChunkForBLE(msg, protocol.BLEMaxPacketSize)
+	d.writeMu.Lock()
 	for i, chunk := range chunks {
 		logger.Debugf(ctx, "  writing chunk %d/%d: %X", i+1, len(chunks), chunk)
 		if err := d.charWrite.Write(chunk, false); err != nil {
+			d.writeMu.Unlock()
 			return nil, fmt.Errorf("failed to write chunk: %w", err)
 		}
 	}
+	d.writeMu.Unlock()
 
 	select {
 	case <-ctx.Done():
@@ -484,6 +526,8 @@ func (d *Device) sendNoResponseHeader16(ctx context.Context, cmd messagecode.Cod
 	msg := protocol.EncodeMessage(cmd, seq, payload)
 
 	chunks := protocol.ChunkForBLE(msg, protocol.BLEMaxPacketSize)
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	for _, chunk := range chunks {
 		if err := d.charWrite.Write(chunk, false); err != nil {
 			return fmt.Errorf("failed to write chunk: %w", err)
@@ -492,8 +536,217 @@ func (d *Device) sendNoResponseHeader16(ctx context.Context, cmd messagecode.Cod
 	return nil
 }
 
+// --- Network framing (X5 and newer) ---
+//
+// Verified against real Insta360 X5 hardware: commands are sent as the same
+// length-prefixed packet format that the camera uses on its WiFi TCP
+// control channel (see pkg/protocol/netframe.go). The camera acknowledges
+// accepted commands with a MESSAGE packet with code 200 that echoes our
+// sequence number.
+
+// nextNetSeq returns the next sequence number (1-254) for network framing.
+func (d *Device) nextNetSeq() uint8 {
+	d.netSeqCounter++
+	if d.netSeqCounter == 0 || d.netSeqCounter > 254 {
+		d.netSeqCounter = 1
+	}
+	return d.netSeqCounter
+}
+
+// netHandshake sends the network SYNC packet and waits for the camera echo.
+func (d *Device) netHandshake(ctx context.Context) error {
+	d.netSyncCh = make(chan struct{}, 1)
+
+	logger.Infof(ctx, "sending network sync handshake...")
+	d.writeMu.Lock()
+	err := d.charWrite.Write(protocol.EncodeNetSync(), false)
+	d.writeMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to write sync packet: %w", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case <-d.netSyncCh:
+		logger.Infof(ctx, "network sync handshake complete")
+		return nil
+	case <-waitCtx.Done():
+		return fmt.Errorf("no sync echo within 5s: %w", waitCtx.Err())
+	}
+}
+
+// startNetKeepalive starts the host-side keep-alive loop. The camera sends
+// its own keep-alives about once a second and expects the same from the host.
+func (d *Device) startNetKeepalive() {
+	ctx, cancel := context.WithCancel(context.Background())
+	d.netKeepaliveCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				d.writeMu.Lock()
+				err := d.charWrite.Write(protocol.EncodeNetKeepalive(), false)
+				d.writeMu.Unlock()
+				if err != nil {
+					logger.Warnf(ctx, "network keepalive write failed: %v", err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// handleNetNotification processes raw BE82 notifications for network-framed
+// cameras. Notifications may be split across BLE packets, so frames are
+// reassembled using the length prefix.
+func (d *Device) handleNetNotification(ctx context.Context, b []byte) {
+	d.mu.Lock()
+	d.netRxBuf = append(d.netRxBuf, b...)
+	buf := d.netRxBuf
+	d.mu.Unlock()
+
+	consumed := 0
+	for len(buf)-consumed >= 4 {
+		total := int(binary.LittleEndian.Uint32(buf[consumed : consumed+4]))
+		if total < 4 {
+			logger.Warnf(ctx, "invalid network frame length %d; discarding buffer", total)
+			consumed = len(buf)
+			break
+		}
+		if total > len(buf)-consumed {
+			break // wait for more BLE packets
+		}
+		d.processNetFrame(ctx, buf[consumed:consumed+total])
+		consumed += total
+	}
+
+	if consumed > 0 {
+		d.mu.Lock()
+		d.netRxBuf = append([]byte(nil), buf[consumed:]...)
+		d.mu.Unlock()
+	}
+}
+
+func (d *Device) processNetFrame(ctx context.Context, frame []byte) {
+	payload := frame[4:]
+	if len(payload) < 1 {
+		return
+	}
+	logger.Debugf(ctx, "network frame: type=0x%02X len=%d payload=%X", payload[0], len(frame), payload)
+
+	switch payload[0] {
+	case protocol.NetPktTypeKeepalive:
+		return
+	case protocol.NetPktTypeSync:
+		logger.Infof(ctx, "network sync echo received")
+		if d.netSyncCh != nil {
+			select {
+			case d.netSyncCh <- struct{}{}:
+			default:
+			}
+		}
+		return
+	case protocol.NetPktTypeMessage:
+		msg, err := protocol.ParseNetMessage(payload)
+		if err != nil {
+			logger.Debugf(ctx, "failed to parse network message: %v", err)
+			return
+		}
+		d.routeNetMessage(ctx, msg, payload)
+		return
+	default:
+		logger.Debugf(ctx, "unhandled network frame type 0x%02X", payload[0])
+	}
+}
+
+// routeNetMessage delivers command responses to waiting callers and forwards
+// everything else as an unsolicited notification.
+func (d *Device) routeNetMessage(ctx context.Context, msg *protocol.NetMessage, raw []byte) {
+	// Command responses carry HTTP-style status codes (200/400/500/501) and
+	// echo the request's sequence number (we generate 1-254).
+	if msg.Code >= 0x00C8 && msg.Code <= 0x01F5 {
+		key := uint8(msg.Seq)
+		d.mu.Lock()
+		ch, ok := d.responseChs[key]
+		d.mu.Unlock()
+		if ok {
+			select {
+			case ch <- raw:
+			default:
+			}
+			return
+		}
+	}
+
+	logger.Debugf(ctx, "network notification: code=0x%04X seq=%d body=%X", msg.Code, msg.Seq, msg.Body)
+	select {
+	case d.notificationCh <- raw:
+	default:
+	}
+}
+
+func (d *Device) sendCommandNet(ctx context.Context, cmd messagecode.Code, payload []byte) ([]byte, error) {
+	seq := d.nextNetSeq()
+
+	respCh := make(chan []byte, 1)
+	d.mu.Lock()
+	d.responseChs[seq] = respCh
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.responseChs, seq)
+		d.mu.Unlock()
+	}()
+
+	frame := protocol.EncodeNetMessage(uint16(cmd), uint32(seq), payload)
+	logger.Debugf(ctx, "sending network cmd=%s(0x%04X) seq=%d frame=%X", cmd, uint16(cmd), seq, frame)
+
+	chunks := protocol.ChunkForBLE(frame, protocol.BLEMaxPacketSize)
+	d.writeMu.Lock()
+	for i, chunk := range chunks {
+		logger.Debugf(ctx, "  writing chunk %d/%d: %X", i+1, len(chunks), chunk)
+		if err := d.charWrite.Write(chunk, false); err != nil {
+			d.writeMu.Unlock()
+			return nil, fmt.Errorf("failed to write network chunk: %w", err)
+		}
+	}
+	d.writeMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-respCh:
+		return resp, nil
+	}
+}
+
+func (d *Device) sendNoResponseNet(ctx context.Context, cmd messagecode.Code, payload []byte) error {
+	frame := protocol.EncodeNetMessage(uint16(cmd), uint32(d.nextNetSeq()), payload)
+	logger.Debugf(ctx, "sending network cmd=%s(0x%04X) (no response) frame=%X", cmd, uint16(cmd), frame)
+
+	chunks := protocol.ChunkForBLE(frame, protocol.BLEMaxPacketSize)
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	for _, chunk := range chunks {
+		if err := d.charWrite.Write(chunk, false); err != nil {
+			return fmt.Errorf("failed to write network chunk: %w", err)
+		}
+	}
+	return nil
+}
+
 // Close disconnects from the camera.
 func (d *Device) Close(ctx context.Context) error {
+	if d.netKeepaliveCancel != nil {
+		d.netKeepaliveCancel()
+		d.netKeepaliveCancel = nil
+	}
 	if d.periph != nil {
 		return d.periph.Disconnect(ctx)
 	}

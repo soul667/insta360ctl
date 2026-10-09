@@ -114,6 +114,12 @@ const (
 	ProtoFormatHeader16 ProtoFormat = iota
 	// ProtoFormatFFFrame is the FF-framed format with CRC-16/Modbus used by GO 2, GO 3.
 	ProtoFormatFFFrame
+	// ProtoFormatNetwork is the length-prefixed network framing used over BLE
+	// by newer cameras (verified on X5): each packet is a 4-byte total-length
+	// prefix followed by the same packet type / 12-byte MESSAGE header that
+	// the camera uses on its WiFi TCP control channel (0x04 MESSAGE,
+	// 0x05 KEEPALIVE, 0x06 SYNC).
+	ProtoFormatNetwork
 )
 
 // DirectProtoFormat returns which wire protocol format this camera model uses
@@ -122,6 +128,8 @@ func (m Model) DirectProtoFormat() ProtoFormat {
 	switch m {
 	case ModelGo3, ModelGo3S:
 		return ProtoFormatFFFrame
+	case ModelX5:
+		return ProtoFormatNetwork
 	default:
 		return ProtoFormatHeader16
 	}

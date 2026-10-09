@@ -92,6 +92,11 @@ func commonMultiFlags() []cli.Flag {
 			Value: 30 * time.Second,
 			Usage: "Deadline for discovering and initializing the cameras",
 		},
+		&cli.DurationFlag{
+			Name:  "command-timeout",
+			Value: 15 * time.Second,
+			Usage: "Deadline for each command sent to a camera during a broadcast (0 = no limit)",
+		},
 	}
 }
 
@@ -135,6 +140,7 @@ func connectMultiManager(c *cli.Context) (context.Context, *multi.Manager, func(
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
+	mgr.CommandTimeout = c.Duration("command-timeout")
 
 	cleanup := func() {
 		mgr.Close(ctx)

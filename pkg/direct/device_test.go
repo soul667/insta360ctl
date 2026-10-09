@@ -314,3 +314,83 @@ func TestSendNoResponseHeader16(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, messagecode.CodePowerOff, hdr.CommandCode)
 }
+
+func TestSendCommandNetRoundtrip(t *testing.T) {
+	dev, writeCh := newTestDevice(camera.ModelX5)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Simulate a camera that acknowledges with 200 OK, echoing the seq.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+
+		lastWrite := writeCh.lastWritten()
+		require.NotNil(t, lastWrite)
+
+		payload, _, err := protocol.DecodeNetFrame(lastWrite)
+		require.NoError(t, err)
+		reqMsg, err := protocol.ParseNetMessage(payload)
+		require.NoError(t, err)
+
+		ack := protocol.EncodeNetMessage(uint16(messagecode.CodeResponseOK), reqMsg.Seq, nil)
+		dev.handleNetNotification(ctx, ack)
+	}()
+
+	resp, err := dev.sendCommandNet(ctx, messagecode.CodeStartRecording, nil)
+	require.NoError(t, err)
+
+	body, err := dev.extractPayload(resp)
+	require.NoError(t, err)
+	assert.Empty(t, body)
+}
+
+func TestSendCommandNetTimeout(t *testing.T) {
+	dev, _ := newTestDevice(camera.ModelX5)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := dev.sendCommandNet(ctx, messagecode.CodeStartRecording, nil)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestExtractPayloadNetError(t *testing.T) {
+	dev, _ := newTestDevice(camera.ModelX5)
+
+	// extractPayload takes the MESSAGE payload after the length prefix.
+	framed := protocol.EncodeNetMessage(uint16(messagecode.CodeResponseError), 7, []byte{0x12, 0x05, 'b', 'o', 'o', 'm', '!'})
+	payload, _, err := protocol.DecodeNetFrame(framed)
+	require.NoError(t, err)
+
+	_, err = dev.extractPayload(payload)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHandleNetNotificationReassemblesFragments(t *testing.T) {
+	dev, _ := newTestDevice(camera.ModelX5)
+	ctx := context.Background()
+
+	respCh := make(chan []byte, 1)
+	dev.responseChs[5] = respCh
+
+	full := protocol.EncodeNetMessage(uint16(messagecode.CodeResponseOK), 5, []byte{0x01, 0x02, 0x03})
+
+	// Deliver the frame split across two BLE notifications.
+	dev.handleNetNotification(ctx, full[:6])
+	select {
+	case <-respCh:
+		t.Fatal("response delivered before the frame was complete")
+	default:
+	}
+	dev.handleNetNotification(ctx, full[6:])
+
+	select {
+	case got := <-respCh:
+		msg, err := protocol.ParseNetMessage(got)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(5), msg.Seq)
+		assert.Equal(t, []byte{0x01, 0x02, 0x03}, msg.Body)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("response was not delivered after reassembly")
+	}
+}
