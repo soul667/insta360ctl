@@ -99,6 +99,17 @@ Connections stay open for the whole session, so commands reach every camera
 within the reported dispatch spread (typically single-digit milliseconds
 with the D-Bus backend).
 
+**Tested dual-X5 setup (this fork):** X5 53F3TQ at `f0:23:ae:62:6c:a0` and
+X5 6JDF89 at `f0:23:ae:76:ef:6e`:
+
+```bash
+# Interactive session (both cameras, synchronized start/stop)
+sudo insta360ctl multi shell --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
+
+# Local web console (Record/Stop buttons) -> http://127.0.0.1:8787
+sudo insta360ctl multi serve --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
+```
+
 ```bash
 # One command for all cameras; prints per-camera dispatch offsets and RTTs
 sudo insta360ctl multi run --addr AA:BB:CC:DD:EE:FF --addr 11:22:33:44:55:66 record start
