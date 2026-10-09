@@ -32,6 +32,7 @@ func main() {
 		Commands: []*cli.Command{
 			cmdScan(),
 			cmdDirect(),
+			cmdMulti(),
 			cmdRemote(),
 			cmdStream(),
 			cmdWifi(),

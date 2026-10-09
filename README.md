@@ -78,6 +78,42 @@ sudo insta360ctl direct power-off
 sudo insta360ctl direct --addr AA:BB:CC:DD:EE:FF shutter
 ```
 
+### Multiple Cameras Simultaneously (e.g. two X5s)
+
+One process, one BLE adapter, all cameras triggered from a shared barrier.
+Connections stay open for the whole session, so commands reach every camera
+within the reported dispatch spread (typically single-digit milliseconds
+with the D-Bus backend).
+
+```bash
+# One command for all cameras; prints per-camera dispatch offsets and RTTs
+sudo insta360ctl multi run --addr AA:BB:CC:DD:EE:FF --addr 11:22:33:44:55:66 record start
+
+# Fire-and-forget (no acknowledgment wait) for the tightest dispatch
+sudo insta360ctl multi run --addr AA:BB --addr CC:DD --no-wait record stop
+
+# Connect now, fire 5 seconds later
+sudo insta360ctl multi run --addr AA:BB --addr CC:DD --delay 5s record start
+
+# Or keep a session open and drive all cameras from the prompt
+sudo insta360ctl multi shell --addr AA:BB --addr CC:DD
+x5> mode video
+x5> start
+x5> start 5s       # synchronized fire with a countdown
+x5> stop
+x5> status
+x5> quit
+
+# --all attaches to every Insta360 camera in range during the scan window
+sudo insta360ctl multi shell --all --scan-window 5s
+```
+
+`multi` synchronizes *command dispatch*, not sensor exposure: the BLE
+command reaches both cameras within the printed dispatch spread, but each
+camera then takes its own internal time to start the pipeline. Verify the
+real offset with a clap/LED marker and correct it in post. See
+[doc/multi_camera.md](doc/multi_camera.md) for details.
+
 ### GPS Remote (Architecture A)
 
 ```bash
