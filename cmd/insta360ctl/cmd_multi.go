@@ -69,6 +69,7 @@ with a clap/LED marker and correct it in post (see doc/multi_camera.md).`,
 				Flags: commonMultiFlags(),
 				Action: multiShell,
 			},
+			cmdMultiServe(),
 		},
 	}
 }

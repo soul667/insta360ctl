@@ -120,6 +120,10 @@ x5> quit
 
 # --all attaches to every Insta360 camera in range during the scan window
 sudo insta360ctl multi shell --all --scan-window 5s
+
+# Local web console: click Record / Stop in the browser
+sudo insta360ctl multi serve --addr AA:BB --addr CC:DD
+# -> open http://127.0.0.1:8787 (add --listen 0.0.0.0:8787 for phones)
 ```
 
 `multi` synchronizes *command dispatch*, not sensor exposure: the BLE
